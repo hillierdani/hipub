@@ -15,39 +15,74 @@ LEGIT_ACADEMIC_DOMAINS = [
 
 import urllib.parse
 
+import urllib.parse
+
+
+def handle_web_fallback(url):
+    """Generates clean, structured metadata descriptions out of web resources or raw URLs."""
+    try:
+        # Try a swift header scrape for native page titles (handles YouTube, Scribbr, etc.)
+        if not url.lower().endswith(('.pdf', '.rtf', '.docx')):
+            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req, timeout=3) as response:
+                html = response.read().decode('utf-8', errors='ignore')
+                title_match = re.search(r'<title[^>]*>(.*?)</title>', html, re.IGNORECASE | re.DOTALL)
+                if title_match:
+                    page_title = re.sub(r'\s+', ' ', title_match.group(1).strip())
+                    if len(page_title) > 4:
+                        domain = urlparse(url).netloc.replace('www.', '').split('.')[0].capitalize()
+                        return [domain], "2026", page_title, ""
+    except Exception:
+        pass
+
+    # Fallback to intelligent URL file name parsing if the page blocks scraping
+    parsed = urlparse(url)
+    domain = parsed.netloc.replace('www.', '').split('.')[0].capitalize()
+    path_segments = [s for s in parsed.path.split('/') if s]
+    if path_segments:
+        last_seg = path_segments[-1]
+        last_seg = re.sub(r'\.(pdf|html|htm|rtf|aspx)$', '', last_seg, flags=re.IGNORECASE)
+        title_text = re.sub(r'[_+\-]+', ' ', last_seg).strip().title()
+        if len(title_text) > 4:
+            return [domain], "2026", f"[{domain}] {title_text}", ""
+    return [domain], "2026", f"[{domain}] Web Resource", ""
+
 
 def get_live_metadata(url):
-    """Advanced metadata parser that resolves structured patterns, scrapes meta tags,
-    queries filenames semantically via Crossref, and captures webpage title layers."""
+    """Queries Crossref and Entrez registries via explicit DOI parsing,
+    identifier tracking, and filename semantic querying."""
+    # Initialize variables for structural filename parsing fallbacks
+    filename_author, filename_year, filename_title = "Unknown", "2026", ""
+
     try:
-        scrape_url = url
+        # 1. Isolate administrative or service domains to bypass API delays
+        ADMIN_DOMAINS = ['europa.eu', 'youtube.com', 'scribbr.com', 'grammar.com', 'languagetool.org', 'reescribirtextos.net', 'ahrefs.com', 'bio-techne.com', 'horizonteeuropa.es']
+        if any(dom in url.lower() for dom in ADMIN_DOMAINS):
+            return handle_web_fallback(url)
+
         doi = ""
         doi_query = ""
 
-        # --- Step A: Structural Transpositions & Cleanups ---
-        if 'openreview.net/pdf' in url.lower():
-            scrape_url = url.replace('/pdf?', '/forum?')
-        elif 'hal.science' in url.lower():
-            scrape_url = re.sub(r'/file/.*$', '', scrape_url)
-            scrape_url = re.sub(r'/document/?$', '', scrape_url)
+        # 2. General DOI Aggressive Extractor (Captures Wiley, PNAS, Science, Royal Society, bioRxiv codes)
+        doi_match = re.search(r'(10\.\d{4,9}/[^\s,)\"\]\?]+)', url)
+        if doi_match:
+            doi = doi_match.group(1)
+            # Remove typical asset trailing noise from the extracted DOI string
+            for suffix in ['.full.pdf', '.full-text', '.full', '.pdf', '/full', '/pdf', '/abstract']:
+                if doi.lower().endswith(suffix):
+                    doi = doi[:-len(suffix)]
+            doi = re.sub(r'v\d+$', '', doi, flags=re.IGNORECASE)
 
-        # Extract explicit eLife article references
-        elife_match = re.search(r'elifesciences\.org/articles/(\d+)', url, re.IGNORECASE)
-        if elife_match:
-            doi = f"10.7554/eLife.{elife_match.group(1)}"
+        # 3. Handle Platform Subdomain Mappings (eLife, arXiv, PMC)
+        if not doi:
+            elife_match = re.search(r'elifesciences\.org/articles/(\d+)', url, re.IGNORECASE)
+            if elife_match:
+                doi = f"10.7554/eLife.{elife_match.group(1)}"
 
-        # Extract explicit arXiv tracking tokens
-        arxiv_match = re.search(r'arxiv\.org/(?:pdf|abs)/(\d+\.\d+)', url, re.IGNORECASE)
-        if arxiv_match:
-            doi = f"10.48550/arXiv.{arxiv_match.group(1)}"
+            arxiv_match = re.search(r'arxiv\.org/(?:pdf|abs)/(\d+\.\d+)', url, re.IGNORECASE)
+            if arxiv_match:
+                doi = f"10.48550/arXiv.{arxiv_match.group(1)}"
 
-        # Isolate ScienceDirect PII Identifiers to resolve via Crossref lookup query
-        pii_match = re.search(r'/pii/([\w\d]{14,18})', url, re.IGNORECASE)
-        if pii_match:
-            doi_query = pii_match.group(1)
-
-        # --- Step B: Traditional PMC / PubMed Query Routing ---
-        if not doi and not doi_query:
             pmc_match = re.search(r'pmc\.ncbi\.nlm\.nih\.gov/articles/PMC(\d+)', url, re.IGNORECASE) or \
                         re.search(r'ncbi\.nlm\.nih\.gov/pmc/articles/PMC(\d+)', url, re.IGNORECASE)
             if pmc_match:
@@ -58,57 +93,53 @@ def get_live_metadata(url):
                     data = json.loads(response.read().decode())
                     info = data['result'][pmcid]
                     authors = [au['name'] for au in info.get('authors', [])] if info.get('authors') else ["Unknown"]
-                    return authors, re.search(r'\b\d{4}\b', info.get('pubdate', '')).group(0), info.get('title', 'Reference'), info.get('source', 'PMC')
+                    year = re.search(r'\b\d{4}\b', info.get('pubdate', '2026')).group(0)
+                    return authors, year, info.get('title', 'Reference'), info.get('source', 'PMC')
 
-            pubmed_match = re.search(r'pubmed\.ncbi\.nlm\.nih\.gov/(\d+)', url, re.IGNORECASE)
-            if pubmed_match:
-                pmid = pubmed_match.group(1)
-                api_url = f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi?db=pubmed&id={pmid}&retmode=json"
-                req = urllib.request.Request(api_url, headers={'User-Agent': 'Mozilla/5.0'})
-                with urllib.request.urlopen(req, timeout=4) as response:
-                    data = json.loads(response.read().decode())
-                    info = data['result'][pmid]
-                    authors = [au['name'] for au in info.get('authors', [])] if info.get('authors') else ["Unknown"]
-                    return authors, re.search(r'\b\d{4}\b', info.get('pubdate', '')).group(0), info.get('title', 'Reference'), info.get('source', '')
+        # 4. Resolve Database Identifiers or Raw Filenames for Search
+        if not doi:
+            pii_match = re.search(r'/pii/([\w\d]{14,18})', url, re.IGNORECASE)
+            if pii_match:
+                doi_query = pii_match.group(1)
+            elif 'academic.oup.com' in url.lower():
+                oup_match = re.search(r'/article/(\d+)', url) or re.search(r'/article/[^/]+/(\d+)', url)
+                if oup_match:
+                    doi_query = f"Oxford OUP {oup_match.group(1)}"
+            elif 'arvojournals.org' in url.lower():
+                arvo_match = re.search(r'articleid=(\d+)', url, re.IGNORECASE)
+                if arvo_match:
+                    doi_query = f"ARVO article {arvo_match.group(1)}"
+            elif url.lower().endswith('.pdf'):
+                # Extract file name words from raw university library paths
+                filename = url.split('/')[-1].replace('.pdf', '')
+                filename_title = re.sub(r'[_+\-]+', ' ', filename).strip()
 
-        # --- Step C: HTML Header Scraper Fallback & Web Title Captures ---
-        if not doi and not doi_query and not url.lower().endswith('.pdf'):
-            try:
-                req = urllib.request.Request(scrape_url, headers={'User-Agent': 'Mozilla/5.0'})
-                with urllib.request.urlopen(req, timeout=4) as response:
-                    html = response.read().decode('utf-8', errors='ignore')
-                    meta_match = re.search(r'<meta[^>]*name=["\'](?:citation_doi|dc\.identifier|dc\.doi)["\'][^>]*content=["\'](10\.\d{4,9}/[^"\']+)["\']', html, re.IGNORECASE) or \
-                                 re.search(r'<meta[^>]*content=["\'](10\.\d{4,9}/[^"\']+)["\'][^>]*name=["\'](?:citation_doi|dc\.identifier|dc\.doi)["\']', html, re.IGNORECASE)
-                    if meta_match:
-                        doi = meta_match.group(1)
-                    else:
-                        # Fallback for administrative or non-document web resources (ERC, YouTube, etc.)
-                        title_match = re.search(r'<title[^>]*>(.*?)</title>', html, re.IGNORECASE | re.DOTALL)
-                        if title_match:
-                            page_title = re.sub(r'\s+', ' ', title_match.group(1).strip())
-                            year_match = re.search(r'\b(202\d|201\d)\b', scrape_url)
-                            year = year_match.group(0) if year_match else "2026"
-                            domain_name = urlparse(scrape_url).netloc.replace('www.', '').split('.')[0].capitalize()
-                            return [domain_name], year, page_title, ""  # Empty journal signifies it's a structural web document
-            except Exception:
-                pass
+                # Pre-extract structured author/year formatting rules (e.g., Namima2025_JNeurosci)
+                fn_match = re.search(r'^([A-Za-z]+)(\d{4})', filename)
+                if fn_match:
+                    filename_author = fn_match.group(1)
+                    filename_year = fn_match.group(2)
 
-        # --- Step D: Lab Publication PDF Metadata Query Fallback ---
-        if not doi and not doi_query and url.lower().endswith('.pdf'):
-            filename = url.split('/')[-1].replace('.pdf', '')
-            query_text = re.sub(r'[_+\-]+', ' ', filename).strip()
-            if len(query_text) > 10:
-                doi_query = query_text
+                query_text = re.sub(r'(?<!^)(?=[A-Z])', ' ', filename)  # Split camelCase strings
+                query_text = re.sub(r'[_+\-]+', ' ', query_text).strip()
+                if len(query_text) > 8:
+                    doi_query = query_text
 
-        # --- Step E: Execution Engine via Crossref Metadata Store ---
-        final_query = doi if doi else doi_query
-        if final_query:
-            api_param = f"works/{final_query}" if doi else f"works?query={urllib.parse.quote(final_query)}&rows=1"
+        # 5. Submit Query Packet directly to the Crossref Registry
+        final_target = doi if doi else doi_query
+        if final_target:
+            api_param = f"works/{final_target}" if doi else f"works?query={urllib.parse.quote(final_target)}&rows=1"
             api_url = f"https://api.crossref.org/{api_param}"
             req = urllib.request.Request(api_url, headers={'User-Agent': 'Mozilla/5.0'})
             with urllib.request.urlopen(req, timeout=4) as response:
                 data = json.loads(response.read().decode())
-                item = data['message']['items'][0] if 'items' in data['message'] else data['message']
+
+                if 'items' in data['message']:
+                    if not data['message']['items']:
+                        raise ValueError()
+                    item = data['message']['items'][0]
+                else:
+                    item = data['message']
 
                 title = item.get('title', ['Academic Reference'])[0]
                 journal = item['container-title'][0] if item.get('container-title') else ""
@@ -117,7 +148,12 @@ def get_live_metadata(url):
                     for au in item['author']:
                         family, given = au.get('family', ''), au.get('given', '')
                         authors.append(f"{family}, {given}" if family and given else family)
+
+                # Sanitize empty string array objects to completely neutralize the split index crash
+                authors = [au.strip() for au in authors if au and au.strip()]
                 if not authors:
+                    if filename_author != "Unknown":
+                        return [filename_author], filename_year, filename_title, "Journal PDF"
                     authors = ["Unknown"]
 
                 year = "2026"
@@ -126,9 +162,17 @@ def get_live_metadata(url):
                         year = str(item[date_field]['date-parts'][0][0])
                         break
                 return authors, year, title, journal
+
+        # 6. Primary Safety Catch: If no search query worked but filename data is clean
+        if filename_author != "Unknown":
+            return [filename_author], filename_year, filename_title, "Journal PDF"
+        return handle_web_fallback(url)
+
     except Exception:
-        pass
-    return None
+        # 7. Emergency Exception Wrapper Fallback Strategy
+        if filename_author != "Unknown":
+            return [filename_author], filename_year, filename_title, "Journal PDF"
+        return handle_web_fallback(url)
 
 
 def parse_fallback_meta(url, ref_num):
@@ -147,14 +191,20 @@ def parse_fallback_meta(url, ref_num):
 
 
 def get_display_author(authors, fallback="Unknown"):
-    """Parses a single scannable string for Word document in-text bracket injections."""
-    if not authors:
+    """Parses a single scannable string for Word document in-text bracket injections securely."""
+    if not authors or not isinstance(authors, list):
         return fallback
-    first_author = authors[0]
-    # Handle "Family, Given" splitting vs "Family GI" splitting
-    lastname = first_author.split(',')[0].strip() if ',' in first_author else first_author.split()[0].strip()
 
-    if len(authors) > 1:
+    # Filter out empty strings or padding whitespace
+    clean_authors = [a.strip() for a in authors if a and a.strip()]
+    if not clean_authors:
+        return fallback
+
+    first_author = clean_authors[0]
+    tokens = first_author.split(',') if ',' in first_author else first_author.split()
+    lastname = tokens[0].strip() if tokens else fallback
+
+    if len(clean_authors) > 1:
         return f"{lastname} et al."
     return lastname
 
