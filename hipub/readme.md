@@ -4,6 +4,8 @@ The Step-by-Step Conversion Process
 
 or provide the full path to the docx file in PyCharm's Run -> Edit configurations -> Script Parameters box.
 
+You may need to create a PMC/NCBI account and generate your API key.
+
 Once the script completes, follow these steps to turn those text brackets into live Zotero items:
 
 # Step 1: Import the RIS into Zotero
@@ -13,6 +15,7 @@ Once the script completes, follow these steps to turn those text brackets into l
 
 3. Zotero will import these items. They will temporarily have titles like "Perplexity Link 298" and authors named "Ref298". Leave them exactly like this for now.
 
+4. Imported references should go to a new collection. If you see many unresolved links or weird items, you can remove new items cmd-option-backspace can move these into trash. This way you don't clutter your zotero database.
 # Step 2: Convert the Word Doc to RTF
 1. Open the newly created marked_document.docx in Microsoft Word.
 2. Go to File > Save As.
