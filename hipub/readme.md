@@ -6,6 +6,8 @@ or provide the full path to the docx file in PyCharm's Run -> Edit configuration
 
 You may need to create a PMC/NCBI account and generate your API key.
 
+The script tries to resolve as many as possible scientific journal references. Performs de-duplication and discards references that are clearly not scientific.
+
 Once the script completes, follow these steps to turn those text brackets into live Zotero items:
 
 # Step 1: Import the RIS into Zotero
@@ -13,7 +15,7 @@ Once the script completes, follow these steps to turn those text brackets into l
 
 2. Go to File > Import > select A file > choose zotero_import.ris.
 
-3. Zotero will import these items. They will temporarily have titles like "Perplexity Link 298" and authors named "Ref298". Leave them exactly like this for now.
+3. Zotero will import these items. Some references will have weird creators: those are not scientific journal links.
 
 4. Imported references should go to a new collection. If you see many unresolved links or weird items, you can remove new items cmd-option-backspace can move these into trash. This way you don't clutter your zotero database.
 # Step 2: Convert the Word Doc to RTF
