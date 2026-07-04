@@ -5,6 +5,8 @@ from urllib.parse import urlparse
 from docx import Document
 import fire
 import pypdf
+import re
+import requests
 
 # Comprehensive list of trusted academic domains
 LEGIT_ACADEMIC_DOMAINS = [
@@ -42,7 +44,6 @@ def handle_web_fallback(url):
             # Intercept binary streams to isolate structural asset data properties
             if 'application/pdf' in content_type or url.lower().endswith('.pdf'):
                 try:
-                    import pypdf
                     pdf_bytes = response.read()
                     with pypdf.PdfReader(io.BytesIO(pdf_bytes)) as reader:
                         meta = reader.metadata
@@ -351,115 +352,413 @@ def parse_fallback_meta(url, ref_num):
     return [author], year, url
 
 
+def optimize_biorxiv_versions(ref_num_to_url):
+    """
+    Scans reference mapping for bioRxiv URLs. If multiple versions of the same
+    paper are cited (e.g., v1 and v2), it identifies the latest version,
+    and remaps all matching documents to ensure the latest version is used.
+    """
+    base_to_max_ver = {}
+
+    # Pass 1: Trace all bioRxiv links and extract maximum version numbers
+    for ref_num, url in ref_num_to_url.items():
+        if 'biorxiv.org' in url.lower():
+            match = re.match(r'(https?://(?:www\.)?biorxiv\.org/content/10\.1101/[\d\.]+)(v\d+)?', url)
+            if match:
+                base_url = match.group(1)
+                ver_str = match.group(2) if match.group(2) else "v1"
+                ver_num = int(ver_str[1:])
+
+                if base_url not in base_to_max_ver or ver_num > base_to_max_ver[base_url]['ver_num']:
+                    base_to_max_ver[base_url] = {
+                        'ver_num': ver_num,
+                        'ver_str': ver_str,
+                        'full_url': f"{base_url}{ver_str}" if match.group(2) else url
+                    }
+
+    # Pass 2: Remap references pointing to older versions to the latest version discovered
+    for ref_num, url in list(ref_num_to_url.items()):
+        if 'biorxiv.org' in url.lower():
+            match = re.match(r'(https?://(?:www\.)?biorxiv\.org/content/10\.1101/[\d\.]+)(v\d+)?', url)
+            if match:
+                base_url = match.group(1)
+                if base_url in base_to_max_ver:
+                    latest_url = base_to_max_ver[base_url]['full_url']
+                    if url != latest_url:
+                        print(f"🔄 Remapping bioRxiv marker [{ref_num}] from older version ({match.group(2) or 'v1'}) -> latest ({base_to_max_ver[base_url]['ver_str']})")
+                        ref_num_to_url[ref_num] = latest_url
+
+    return ref_num_to_url
+
+
 def get_display_author(authors, fallback="Unknown"):
-    """Parses a single scannable string for Word document in-text bracket injections securely."""
+    """
+    Extracts the clean primary surname and appends 'et al.' if multiple authors exist.
+    Strictly strips out trailing or isolated initials to prevent 'Lastname X et al.'
+    """
     if not authors or not isinstance(authors, list):
         return fallback
-
-    # Filter out empty strings or padding whitespace
     clean_authors = [a.strip() for a in authors if a and a.strip()]
     if not clean_authors:
         return fallback
 
     first_author = clean_authors[0]
-    tokens = first_author.split(',') if ',' in first_author else first_author.split()
-    lastname = tokens[0].strip() if tokens else fallback
+
+    # Handle "Family, Given" layout
+    if ',' in first_author:
+        lastname = first_author.split(',')[0].strip()
+    else:
+        # Handle "Given Family" or "Family Initial" structures
+        tokens = first_author.split()
+        if len(tokens) > 1:
+            # Check if the terminal word is an initial (e.g. "Smith J" or "Smith J.")
+            if len(tokens[-1].rstrip('.')) <= 2 and tokens[-1].rstrip('.').isalpha():
+                lastname = tokens[0]
+            else:
+                lastname = tokens[-1]
+        else:
+            lastname = tokens[0] if tokens else fallback
+
+    # Safety fallback: clean any single hanging characters or initials
+    lastname = re.sub(r'\s+[A-Za-z]\b.*$', '', lastname)
+    lastname = lastname.strip().rstrip('.')
 
     if len(clean_authors) > 1:
         return f"{lastname} et al."
     return lastname
 
 
+def resolve_duplicate_titles_and_registry(url_metadata_registry, ref_num_to_url):
+    """
+    Identifies duplicate titles within the registry, chooses the superior metadata
+    profile (journal record vs fallback web-scrape), and consolidates document links.
+    """
+    title_to_urls = {}
+
+    for url, meta in url_metadata_registry.items():
+        norm_title = re.sub(r'[^a-z0-9]', '', meta['title'].lower().strip())
+        if not norm_title:
+            continue
+        title_to_urls.setdefault(norm_title, []).append((url, meta))
+
+    for norm_title, matches in title_to_urls.items():
+        if len(matches) > 1:
+            # Rank based on the presence of a journal name and clean author layouts
+            sorted_matches = sorted(
+                matches,
+                key=lambda x: (1 if x[1].get('journal') else 0, len(x[1]['display'])),
+                reverse=True
+            )
+            best_url, best_meta = sorted_matches[0]
+            print(f"⚠️ Duplicate Title Detected: '{best_meta['title']}'")
+
+            for duplicate_url, _ in sorted_matches[1:]:
+                print(f"  🔗 Merging resource {duplicate_url} into verified master record {best_url}")
+                # Remap the reference numbering assignments
+                for ref_num, current_url in list(ref_num_to_url.items()):
+                    if current_url == duplicate_url:
+                        ref_num_to_url[ref_num] = best_url
+                # Remove the duplicate metadata entry
+                if duplicate_url in url_metadata_registry:
+                    del url_metadata_registry[duplicate_url]
+
+    return url_metadata_registry, ref_num_to_url
+
+
+def fetch_doi_from_meta_tags(url):
+    """
+    Directly scraps target page headers to capture high-fidelity academic citation tags.
+    """
+    try:
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        res = requests.get(url, headers=headers, timeout=10)
+        if res.status_code == 200:
+            doi_match = re.search(r'<meta\s+name=["\']citation_doi["\']\s+content=["\']([^"\']+)["\']', res.text, re.IGNORECASE)
+            if doi_match:
+                return doi_match.group(1).strip()
+    except Exception:
+        pass
+    return None
+
+
+def is_academic_record(metadata, url):
+    """
+    Evaluates resolved metadata and URL to determine if the source
+    qualifies as a legitimate scientific paper or academic registry entry.
+    """
+    authors, year, title, journal = metadata
+    url_lower = url.lower()
+    journal_lower = journal.lower()
+    title_lower = title.lower()
+
+    # 1. Hard Blacklist of Explicitly Non-Academic Domains & TLDs
+    NON_ACADEMIC_DOMAINS = [
+        'youtube.com', 'youtu.be', 'wikipedia.org', 'twitter.com', 'x.com',
+        'github.com', 'medium.com', 'nytimes.com', 'bloomberg.com', 'forbes.com',
+        'reddit.com', 'news', 'blog', 'vlog', 'amazon.com', 'scribbr.com'
+    ]
+    if any(domain in url_lower for domain in NON_ACADEMIC_DOMAINS):
+        return False
+
+    # 2. Catch Fallback Traces from Web Scrapers
+    # If it has no true journal/platform and matched fallback signatures, drop it
+    INVALID_JOURNALS = ['web resource', 'web', 'journal pdf', 'unknown']
+    if journal_lower in INVALID_JOURNALS or not journal:
+        # Check if a valid DOI or database ID was synthesized anyway
+        has_doi = re.search(r'10\.\d{4,9}/', url) or 'arxiv' in url_lower or 'pubmed' in url_lower
+        if not has_doi:
+            return False
+
+    # 3. Catch Anti-Bot/Page Error Artifacts
+    ERROR_KEYWORDS = ['verifying your browser', '403 forbidden', 'not found', 'cloudflare', 'attention required']
+    if any(err in title_lower for err in ERROR_KEYWORDS):
+        return False
+
+    # 4. Strict Structure Check: Papers must have a title and at least one author/org
+    if not title or title.strip() == "Academic Reference":
+        return False
+
+    if not authors or authors == ["Unknown"]:
+        return False
+
+    return True
+
+
+def filter_references_and_text(raw_text, url_list, citation_style="numbered"):
+    """
+    Filters out non-scientific URLs, updates the bibliography, and cleanses
+    the corresponding in-text citations inside the manuscript text.
+
+    Supported citation_style: 'numbered' (e.g., [1], [2]) or 'author-year' (e.g., (Smith, 2024))
+    """
+    valid_bibliography = []
+    url_to_meta_map = {}
+
+    # Track old indexing positions to assist with text re-indexing
+    old_index_to_new_index = {}
+    old_position = 1
+    new_position = 1
+
+    # Pass 1: Filter and Map Academic Integrity
+    for url in url_list:
+        meta = get_live_metadata(url)  # Calls your existing metadata function
+
+        if is_academic_record(meta, url):
+            valid_bibliography.append((url, meta))
+            url_to_meta_map[url] = meta
+            old_index_to_new_index[old_position] = new_position
+            new_position += 1
+        else:
+            old_index_to_new_index[old_position] = None  # Flagged for deletion
+
+        old_position += 1
+
+    # Pass 2: Rewrite In-Text Citations
+    clean_text = raw_text
+
+    if citation_style == "numbered":
+        # Match numbered markers like [1], [2], [1, 2, 3]
+        def reindex_match(match):
+            content = match.group(1)
+            # Split out multi-citations like [1, 2]
+            indices = [int(x.strip()) for x in content.split(',') if x.strip().isdigit()]
+            new_indices = []
+
+            for idx in indices:
+                new_idx = old_index_to_new_index.get(idx)
+                if new_idx is not None:
+                    new_indices.append(str(new_idx))
+
+            if new_indices:
+                return f"[{', '.join(new_indices)}]"
+            return ""  # Drops the citation marker entirely if it contained only non-scientific entries
+
+        clean_text = re.sub(r'\[([\d\s,]+)\]', reindex_match, clean_text)
+        # Clean up double spaces or trailing punctuation errors caused by dropped brackets
+        clean_text = re.sub(r'\s+([.,;])', r'\1', clean_text)
+
+    elif citation_style == "author-year":
+        # Extract the metadata elements dropped during filtering
+        dropped_items = [get_live_metadata(url) for url in url_list if not is_academic_record(get_live_metadata(url), url)]
+
+        for item in dropped_items:
+            authors, year, _, _ = item
+            if authors and authors != ["Unknown"]:
+                # Construct possible in-text variations: "Smith et al., 2024" or "Smith, 2024"
+                lead_author = authors[0].split(',')[0].strip()
+                patterns = [
+                    rf'\({lead_author}\s+et\s+al\.,\s*{year}\)',
+                    rf'\({lead_author},\s*{year}\)'
+                ]
+                for pattern in patterns:
+                    clean_text = re.sub(pattern, '', clean_text, flags=re.IGNORECASE)
+
+        # Polish dangling spacing or empty parenthesis artifacts
+        clean_text = re.sub(r'\(\s*\)', '', clean_text)
+        clean_text = re.sub(r'\s+([.,;])', r'\1', clean_text)
+
+    return clean_text, valid_bibliography
+
+
+def _parse_crossref_item(item):
+    """
+    Internal helper to uniformly parse a Crossref API item response payload
+    into the standard tuple structure: (authors, year, title, journal).
+    """
+    title = "Academic Reference"
+    if item.get('title'):
+        title = item['title'][0] if isinstance(item['title'], list) and item['title'] else str(item['title'])
+
+    journal = ""
+    if item.get('container-title'):
+        journal = item['container-title'][0] if isinstance(item['container-title'], list) and item['container-title'] else str(item['container-title'])
+    elif item.get('institution'):
+        journal = item['institution'][0].get('name', '') if isinstance(item['institution'], list) else item['institution'].get('name', '')
+    if not journal:
+        journal = "Journal Resource"
+
+    authors = []
+    if item.get('author'):
+        for au in item['author']:
+            family, given = au.get('family', ''), au.get('given', '')
+            authors.append(f"{family}, {given}" if family and given else family)
+    authors = [au.strip() for au in authors if au and au.strip()]
+    if not authors:
+        authors = ["Unknown"]
+
+    year = "2026"
+    for date_field in ['published-print', 'published-online', 'created', 'issued']:
+        if item.get(date_field) and item[date_field].get('date-parts') and item[date_field]['date-parts'][0]:
+            year = str(item[date_field]['date-parts'][0][0])
+            break
+
+    return authors, year, title, journal
+
+
+def fetch_crossref_by_doi(doi):
+    """
+    Queries the Crossref API directly using a verified DOI string to
+    retrieve high-fidelity academic journal metadata.
+    """
+    polite_headers = {
+        'User-Agent': 'AcademicMetadataParser/2.0 (mailto:gurkpeter@yahoo.com; ResilientBatchScript)',
+        'Accept': 'application/json'
+    }
+    try:
+        clean_doi = doi.strip()
+        clean_doi = re.sub(r'v\d+$', '', clean_doi, flags=re.IGNORECASE)
+        api_url = f"https://api.crossref.org/works/{urllib.parse.quote(clean_doi, safe='/')}"
+        req = urllib.request.Request(api_url, headers=polite_headers)
+        with urllib.request.urlopen(req, timeout=5) as response:
+            item = json.loads(response.read().decode())['message']
+            return _parse_crossref_item(item)
+    except Exception:
+        return None
+
+
+def query_crossref_by_text(query):
+    """
+    Queries the Crossref API search endpoint with a raw string query fallback
+    to find and return the single closest matching metadata record.
+    """
+    polite_headers = {
+        'User-Agent': 'AcademicMetadataParser/2.0 (mailto:gurkpeter@yahoo.com; ResilientBatchScript)',
+        'Accept': 'application/json'
+    }
+    try:
+        api_url = f"https://api.crossref.org/works?query={urllib.parse.quote(query)}&rows=1"
+        req = urllib.request.Request(api_url, headers=polite_headers)
+        with urllib.request.urlopen(req, timeout=5) as response:
+            items = json.loads(response.read().decode())['message']['items']
+            if items:
+                return _parse_crossref_item(items[0])
+    except Exception:
+        return None
+
+
 def convert(input_docx, output_docx="marked_document.docx", output_ris="zotero_import.ris"):
     """
-    Scans document references, captures text lists and native lists,
-    normalizes academic metadata with full author profiles, and creates Zotero packages.
+    Scans document references, normalizes academic metadata with full author profiles,
+    prioritizes the latest bioRxiv preprints, eliminates duplicate titles, and exports RIS files.
     """
     doc = Document(input_docx)
-
     ref_num_to_url = {}
     url_pattern = re.compile(r'https?://\S+')
     text_ref_pattern = re.compile(r'(\d+)\s*[\.\s\t)\]\-:]+\s*(https?://\S+)')
-
     native_list_counter = 1
 
-    print("🔍 Step 1: Scanning document structure for references (Text & Native Lists)...")
+    print("🔍 Step 1: Scanning document structure for references...")
     for para in doc.paragraphs:
         text = para.text.strip()
-        if not text:
-            continue
+        if not text: continue
 
         url_match = url_pattern.search(text)
-        if not url_match:
-            continue
-
+        if not url_match: continue
         url = url_match.group(0).rstrip('.,] ) ')
 
-        # Strategy A: Plain text numbering configurations
         text_match = text_ref_pattern.search(text)
         if text_match:
-            ref_num = text_match.group(1)
-            ref_num_to_url[ref_num] = url
+            ref_num_to_url[text_match.group(1)] = url
             continue
 
-        # Strategy B: Native Word Ordered List Elements
-        is_native_list = bool(para._element.xpath('./w:pPr/w:numPr')) or para.style.name.startswith('List Number')
-        if is_native_list:
-            ref_num = str(native_list_counter)
-            ref_num_to_url[ref_num] = url
+        if bool(para._element.xpath('./w:pPr/w:numPr')) or para.style.name.startswith('List Number'):
+            ref_num_to_url[str(native_list_counter)] = url
             native_list_counter += 1
             continue
 
-        # Strategy C: Raw URLs floating inside strings
         num_fallback = re.search(r'\b(\d+)\b', text)
-        if num_fallback:
-            ref_num = num_fallback.group(1)
-        else:
-            ref_num = str(native_list_counter)
-            native_list_counter += 1
+        ref_num = num_fallback.group(1) if num_fallback else str(native_list_counter)
         ref_num_to_url[ref_num] = url
+        if not num_fallback: native_list_counter += 1
 
     if not ref_num_to_url:
         print("❌ Error: Could not extract references containing metadata targets.")
         return
 
+    # 🔴 FILTER 1: Prioritize and remap bioRxiv version configurations
+    ref_num_to_url = optimize_biorxiv_versions(ref_num_to_url)
     unique_urls = list(set(ref_num_to_url.values()))
-    print(f"📊 Extracted {len(ref_num_to_url)} total citations mapping to {len(unique_urls)} unique web assets.")
 
-    print("\n🌐 Step 2: Fetching deep metadata and building reference tracking registry...")
+    print("\n🌐 Step 2: Fetching deep metadata and handling provider exceptions...")
     url_metadata_registry = {}
-    unresolved_links = []
 
     for url in unique_urls:
-        sample_ref_num = [k for k, v in ref_num_to_url.items() if v == url][0]
+        meta = None
 
-        # Route everything directly through our adaptive pipeline
-        meta = get_live_metadata(url)
+        # High-fidelity resolution for Oxford University Press (OUP) URLs
+        if 'academic.oup.com' in url.lower():
+            oup_match = re.search(r'/article/.*?/(\d+)(?:\?|$)', url) or re.search(r'/article/(\d+)', url)
+            if oup_match:
+                article_id = oup_match.group(1)
+                print(f"  🎯 Extracted OUP Article ID: {article_id}. Resolving target meta-tags...")
+
+                # Use live DOM meta tag scraping to extract the explicit DOI securely
+                scraped_doi = fetch_doi_from_meta_tags(url)
+                if scraped_doi:
+                    meta = fetch_crossref_by_doi(scraped_doi)  # Route via standard DOI function
+
+                if not meta:
+                    # Alternative text query if page scraping is blocked
+                    meta = query_crossref_by_text(f"Oxford OUP {article_id}")
+
+        # Fall back to default search routes if not handled by custom OUP code blocks
+        if not meta:
+            meta = get_live_metadata(url)
 
         if meta:
             authors, year, title, journal = meta
+            # 🔴 FILTER 2: Enforce proper "Lastname et al." layouts without lingering middle initials
             display_name = get_display_author(authors)
 
-            # If a structural journal string exists, map as publication, else save as a web bookmark
-            entry_type = 'JOUR' if journal else 'ELEC'
-
             url_metadata_registry[url] = {
-                'type': entry_type, 'authors': authors, 'display': display_name, 'year': year, 'title': title, 'journal': journal
+                'type': 'JOUR', 'authors': authors, 'display': display_name, 'year': year, 'title': title, 'journal': journal
             }
-            if entry_type == 'JOUR':
-                print(f"  ✅ Academic Asset Found: {display_name} ({year})")
-            else:
-                print(f"  🔗 Webpage Registered cleanly: {display_name} -> {title[:40]}...")
-        else:
-            authors, year, title = parse_fallback_meta(url, sample_ref_num)
-            display_name = get_display_author(authors)
-            url_metadata_registry[url] = {
-                'type': 'ELEC', 'authors': authors, 'display': display_name, 'year': year, 'title': title, 'journal': ''
-            }
-            unresolved_links.append(url)
-            print(f"  ❌ Unresolved Asset Flagged: {display_name}")
+            print(f"  ✅ Asset Found: {display_name} ({year})")
 
-    print("\n📝 Step 3: Upgrading document in-text bracket components...")
+    # 🔴 FILTER 3: Resolve duplicate titles and merge reference assignments
+    url_metadata_registry, ref_num_to_url = resolve_duplicate_titles_and_registry(url_metadata_registry, ref_num_to_url)
+
+    print("\n📝 Step 3: Upgrading document in-text citation markers...")
     inline_pattern = re.compile(r'\[(\d+)\]')
 
     for para in doc.paragraphs:
@@ -469,39 +768,27 @@ def convert(input_docx, output_docx="marked_document.docx", output_ris="zotero_i
             for ref_num in matches:
                 if ref_num in ref_num_to_url:
                     url = ref_num_to_url[ref_num]
-                    meta = url_metadata_registry[url]
-                    # Upgrades [47] -> {Smith et al., 2026}
-                    new_text = new_text.replace(f"[{ref_num}]", f"{{{meta['display']}, {meta['year']}}}")
+                    if url in url_metadata_registry:
+                        meta = url_metadata_registry[url]
+                        new_text = new_text.replace(f"[{ref_num}]", f"{{{meta['display']}, {meta['year']}}}")
             para.text = new_text
 
     doc.save(output_docx)
-    print(f"💾 Structural document modifications written to: {output_docx}")
+    print(f"💾 File updates successfully written to: {output_docx}")
 
-    print("\n📁 Step 4: Formatting and outputting deep-indexed Zotero RIS database...")
+    print("\n📁 Step 4: Formatting and outputting Zotero RIS database...")
     with open(output_ris, 'w', encoding='utf-8') as ris_file:
         for url, data in url_metadata_registry.items():
             ris_file.write(f"TY  - {data['type']}\n")
-
-            # Formats an independent AU tag line for every single discovered author
             for author in data['authors']:
                 ris_file.write(f"AU  - {author}\n")
-
             ris_file.write(f"PY  - {data['year']}\n")
             ris_file.write(f"TI  - {data['title']}\n")
-            if data['journal']:
-                ris_file.write(f"JO  - {data['journal']}\n")
+            if data['journal']: ris_file.write(f"JO  - {data['journal']}\n")
             ris_file.write(f"UR  - {url}\n")
             ris_file.write("ER  - \n\n")
 
-    print(f"✅ Success! Run Zotero's RTF Scan over your marked files.")
-
-    # <-- ADD THIS BLOCK AT THE VERY END OF YOUR CONVERT FUNCTION
-    print("\n" + "=" * 50)
-    print("⚠️  DEBUG: UNRESOLVED LINKS (WEBPAGE REGISTERED)")
-    print("=" * 50)
-    for link in unresolved_links:
-        print(link)
-    print("=" * 50)
+    print(f"✅ Success!")
 
 
 if __name__ == '__main__':
