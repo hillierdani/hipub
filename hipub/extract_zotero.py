@@ -429,40 +429,84 @@ def get_display_author(authors, fallback="Unknown"):
 
 
 def resolve_duplicate_titles_and_registry(url_metadata_registry, ref_num_to_url):
-    """
-    Identifies duplicate titles within the registry, chooses the superior metadata
-    profile (journal record vs fallback web-scrape), and consolidates document links.
-    """
-    title_to_urls = {}
+    url_remap = {}
 
+    # 1. Group items by their base author surname (ignoring tracking index tokens) and year
+    groups = {}
     for url, meta in url_metadata_registry.items():
-        norm_title = re.sub(r'[^a-z0-9]', '', meta['title'].lower().strip())
-        if not norm_title:
+        base_author = re.sub(r'_\d+$', '', meta['display'].lower().strip())
+        year = meta['year']
+        groups.setdefault((base_author, year), []).append((url, meta))
+
+    def get_significant_words(title_str):
+        # Extract alphanumeric words longer than 2 characters to bypass minor typos/formatting shifts
+        return set(re.findall(r'\b[a-z]{3,}\b', title_str.lower()))
+
+    # 2. Perform a fuzzy token overlap analysis within matching author-year groups
+    for (author, year), items in groups.items():
+        if len(items) < 2:
             continue
-        title_to_urls.setdefault(norm_title, []).append((url, meta))
 
-    for norm_title, matches in title_to_urls.items():
-        if len(matches) > 1:
-            # Rank based on the presence of a journal name and clean author layouts
-            sorted_matches = sorted(
-                matches,
-                key=lambda x: (1 if x[1].get('journal') else 0, len(x[1]['display'])),
-                reverse=True
-            )
-            best_url, best_meta = sorted_matches[0]
-            print(f"⚠️ Duplicate Title Detected: '{best_meta['title']}'")
+        merged_urls = set()
+        for i in range(len(items)):
+            url_i, meta_i = items[i]
+            if url_i in merged_urls:
+                continue
 
-            for duplicate_url, _ in sorted_matches[1:]:
-                print(f"  🔗 Merging resource {duplicate_url} into verified master record {best_url}")
-                # Remap the reference numbering assignments
-                for ref_num, current_url in list(ref_num_to_url.items()):
-                    if current_url == duplicate_url:
-                        ref_num_to_url[ref_num] = best_url
-                # Remove the duplicate metadata entry
-                if duplicate_url in url_metadata_registry:
-                    del url_metadata_registry[duplicate_url]
+            words_i = get_significant_words(meta_i['title'])
+            if not words_i:
+                continue
 
-    return url_metadata_registry, ref_num_to_url
+            for j in range(i + 1, len(items)):
+                url_j, meta_j = items[j]
+                if url_j in merged_urls:
+                    continue
+
+                words_j = get_significant_words(meta_j['title'])
+                if not words_j:
+                    continue
+
+                # Calculate how many key terms overlap relative to the shorter title layout
+                intersection = words_i.intersection(words_j)
+                smaller_size = min(len(words_i), len(words_j))
+                overlap_ratio = len(intersection) / smaller_size if smaller_size > 0 else 0
+
+                # If more than 70% of significant words match, they represent the exact same paper
+                if overlap_ratio >= 0.70:
+                    is_i_preprint = 'biorxiv.org' in url_i.lower() or 'medrxiv.org' in url_i.lower()
+                    is_j_preprint = 'biorxiv.org' in url_j.lower() or 'medrxiv.org' in url_j.lower()
+
+                    # Selection rule: Always designate the peer-reviewed platform as the master asset
+                    if is_i_preprint and not is_j_preprint:
+                        master_url, master_meta = url_j, meta_j
+                        dup_url, dup_meta = url_i, meta_i
+                    elif not is_i_preprint and is_j_preprint:
+                        master_url, master_meta = url_i, meta_i
+                        dup_url, dup_meta = url_j, meta_j
+                    else:
+                        # Fallback case: Prefer the item with a validated journal metadata payload
+                        if not meta_i.get('journal') or meta_i['journal'].lower() in ['web resource', 'web', 'journal pdf', 'unknown']:
+                            master_url, master_meta = url_j, meta_j
+                            dup_url, dup_meta = url_i, meta_i
+                        else:
+                            master_url, master_meta = url_i, meta_i
+                            dup_url, dup_meta = url_j, meta_j
+
+                    print(f"⚠️ Duplicate Paper Detected via Fuzzy Title Match: '{master_meta['title']}'")
+                    print(f"   🔗 Merging preprint record {dup_url} -> peer-reviewed master {master_url}")
+
+                    url_remap[dup_url] = master_url
+                    merged_urls.add(dup_url)
+
+                    # Update all matching document pointers dynamically to target the master entry
+                    for ref_num, current_url in list(ref_num_to_url.items()):
+                        if current_url == dup_url:
+                            ref_num_to_url[ref_num] = master_url
+
+                    if dup_url in url_metadata_registry:
+                        del url_metadata_registry[dup_url]
+
+    return url_metadata_registry, ref_num_to_url, url_remap
 
 
 def fetch_doi_from_meta_tags(url):
@@ -885,8 +929,7 @@ def convert(input_docx, output_docx="marked_document.docx", output_ris="zotero_i
             print(f"  ✅ Asset Found: {display_name} ({year})")
 
     # 🔴 FILTER 3: Resolve duplicate titles and merge reference assignments
-    url_metadata_registry, ref_num_to_url = resolve_duplicate_titles_and_registry(url_metadata_registry, ref_num_to_url)
-
+    url_metadata_registry, ref_num_to_url, url_remap = resolve_duplicate_titles_and_registry(url_metadata_registry, ref_num_to_url)
     # 🔴 FILTER 4: Detect and disambiguate {Display, Year} in-text marker
     # collisions so Zotero's RTF Scan never encounters two distinct sources
     # rendered as the exact same citation text.
