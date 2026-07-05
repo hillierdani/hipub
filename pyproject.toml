@@ -7,4 +7,5 @@ dependencies = [
     "fire>=0.7.1",
     "pypdf>=6.14.2",
     "requests>=2.34.2",
+    "pytest>=9.1.1",
 ]
