@@ -676,13 +676,131 @@ def query_crossref_by_text(query):
         return None
 
 
+_LEADING_REF_NUM_RE = re.compile(r'^\s*[\[\(]?(\d{1,4})[\]\)\.\-:]\s+')
+
+
+def _extract_leading_ref_number(text):
+    """
+    Extracts a genuine leading reference-list numeral from raw bibliography
+    paragraph text (e.g. "7. Smith J..." / "[7] Smith J..." / "7) Smith J...").
+    Only matches a numeral anchored at the very start of the paragraph and
+    immediately followed by a delimiter + whitespace.
+
+    This deliberately replaces the old `re.search(r'\b(\d+)\b', text)` fallback,
+    which scanned the *entire* paragraph for any digit run and frequently
+    grabbed an embedded publication year (or DOI fragment) instead of the true
+    reference index -- causing silent ref_num_to_url collisions.
+    """
+    match = _LEADING_REF_NUM_RE.match(text)
+    return match.group(1) if match else None
+
+
+def register_reference(ref_num_to_url, used_ref_nums, candidate_ref_num, url, collision_log):
+    """
+    Safely inserts a (ref_num -> url) mapping, guaranteeing the key is unique.
+
+    Previously, a bare `ref_num_to_url[ref_num] = url` meant that if two
+    references ever resolved to the same key, the *first* reference's URL
+    silently vanished from the pipeline with no warning. Here, a collision
+    generates a synthetic suffixed key for the new entry instead, and logs it,
+    so no reference is ever silently dropped.
+
+    Returns the ref_num actually used as the key.
+    """
+    ref_num = candidate_ref_num
+    if ref_num in used_ref_nums:
+        original = ref_num
+        suffix = 1
+        while ref_num in used_ref_nums:
+            suffix += 1
+            ref_num = f"{original}_dup{suffix}"
+        collision_log.append((original, ref_num, ref_num_to_url.get(original), url))
+        print(f"⚠️  Reference numbering collision on marker [{original}]: an earlier reference "
+              f"('{ref_num_to_url.get(original)}') already claimed this number. The new URL "
+              f"('{url}') is preserved under internal key [{ref_num}] instead of silently "
+              f"overwriting the earlier mapping -- it will still be resolved and included in the "
+              f"RIS export, but will NOT auto-link to an in-text [n] marker. Check the source "
+              f"document's numbering manually.")
+
+    used_ref_nums.add(ref_num)
+    ref_num_to_url[ref_num] = url
+    return ref_num
+
+
+def disambiguate_author_year_collisions(url_metadata_registry):
+    """
+    Detects distinct source URLs that would render identical {Display, Year}
+    in-text citation markers (e.g. two unrelated 'Smith, 2024' papers, or two
+    failed lookups that both collapsed to the same generic fallback such as
+    'Unknown, 2026'). Adds a disambiguating a/b/c suffix to a *separate*
+    'marker_year' field used only for the in-text citation text.
+
+    The RIS record's real 'year' (Publication Year) field is left untouched,
+    so the item's actual bibliographic date stays correct after Zotero import
+    -- only the searchable marker text is disambiguated.
+    """
+    groups = {}
+    for url, meta in url_metadata_registry.items():
+        meta.setdefault('marker_year', meta['year'])
+        key = (meta['display'], meta['year'])
+        groups.setdefault(key, []).append(url)
+
+    collisions_found = []
+    suffixes = 'abcdefghijklmnopqrstuvwxyz'
+
+    for (display, year), urls in groups.items():
+        if len(urls) > 1:
+            collisions_found.append((display, year, urls))
+            for i, url in enumerate(urls):
+                suffix = suffixes[i] if i < len(suffixes) else str(i)
+                marker_year = f"{year}{suffix}"
+                url_metadata_registry[url]['marker_year'] = marker_year
+                print(f"⚠️  Ambiguous marker collision: '{{{display}, {year}}}' shared by "
+                      f"{len(urls)} distinct source(s) -> in-text marker disambiguated to "
+                      f"'{{{display}, {marker_year}}}' for {url} "
+                      f"(RIS Publication Year field remains the true '{year}').")
+
+    return url_metadata_registry, collisions_found
+
+
+def print_collision_summary(ref_num_collisions, marker_collisions, url_metadata_registry):
+    """
+    Prints one consolidated end-of-run report surfacing every ambiguity the
+    pipeline auto-corrected, so the user finds out proactively instead of
+    only discovering it when Zotero's RTF Scan prompts mid-workflow.
+    """
+    print("\n📊 Collision Summary")
+    if ref_num_collisions:
+        print(f"⚠️  {len(ref_num_collisions)} in-text marker numbering collision(s) found in the source document (Step 1):")
+        for original, dup_key, first_url, second_url in ref_num_collisions:
+            print(f"   • marker [{original}] is claimed by two source references:")
+            print(f"       1) {first_url}  (kept as [{original}])")
+            print(f"       2) {second_url}  (preserved under internal key [{dup_key}] -- resolved into the RIS "
+                  f"export, but NOT auto-linked to any [n] marker in the text; check the source numbering manually).")
+
+    if marker_collisions:
+        total_urls_affected = sum(len(urls) for _, _, urls in marker_collisions)
+        print(f"⚠️  {len(marker_collisions)} distinct {{Author, Year}} collision group(s) auto-suffixed "
+              f"({total_urls_affected} references affected) -- verify these in Zotero after import:")
+        for display, year, urls in marker_collisions:
+            print(f"   • {{{display}, {year}}} shared by {len(urls)} distinct sources:")
+            for u in urls:
+                print(f"       - {{{display}, {url_metadata_registry[u]['marker_year']}}}  ({u})")
+
+    if not ref_num_collisions and not marker_collisions:
+        print("✅ No ambiguous reference collisions detected -- every marker maps to exactly one source.")
+
+
 def convert(input_docx, output_docx="marked_document.docx", output_ris="zotero_import.ris"):
     """
     Scans document references, normalizes academic metadata with full author profiles,
-    prioritizes the latest bioRxiv preprints, eliminates duplicate titles, and exports RIS files.
+    prioritizes the latest bioRxiv preprints, eliminates duplicate titles, disambiguates
+    author/year in-text marker collisions, and exports RIS files.
     """
     doc = Document(input_docx)
     ref_num_to_url = {}
+    used_ref_nums = set()
+    ref_num_collisions = []
     url_pattern = re.compile(r'https?://\S+')
     text_ref_pattern = re.compile(r'(\d+)\s*[\.\s\t)\]\-:]+\s*(https?://\S+)')
     native_list_counter = 1
@@ -698,18 +816,24 @@ def convert(input_docx, output_docx="marked_document.docx", output_ris="zotero_i
 
         text_match = text_ref_pattern.search(text)
         if text_match:
-            ref_num_to_url[text_match.group(1)] = url
-            continue
-
-        if bool(para._element.xpath('./w:pPr/w:numPr')) or para.style.name.startswith('List Number'):
-            ref_num_to_url[str(native_list_counter)] = url
+            candidate_ref_num = text_match.group(1)
+        elif bool(para._element.xpath('./w:pPr/w:numPr')) or para.style.name.startswith('List Number'):
+            candidate_ref_num = str(native_list_counter)
             native_list_counter += 1
-            continue
+        else:
+            # 🔴 FIX: only trust a genuine leading numeral marker; never scan the
+            # whole paragraph for an arbitrary digit run (which often grabbed a
+            # publication year instead of the true reference index).
+            leading_num = _extract_leading_ref_number(text)
+            if leading_num:
+                candidate_ref_num = leading_num
+            else:
+                candidate_ref_num = str(native_list_counter)
+                native_list_counter += 1
 
-        num_fallback = re.search(r'\b(\d+)\b', text)
-        ref_num = num_fallback.group(1) if num_fallback else str(native_list_counter)
-        ref_num_to_url[ref_num] = url
-        if not num_fallback: native_list_counter += 1
+        # 🔴 FIX: never let a later reference silently clobber an earlier one
+        # sharing the same key.
+        register_reference(ref_num_to_url, used_ref_nums, candidate_ref_num, url, ref_num_collisions)
 
     if not ref_num_to_url:
         print("❌ Error: Could not extract references containing metadata targets.")
@@ -717,7 +841,12 @@ def convert(input_docx, output_docx="marked_document.docx", output_ris="zotero_i
 
     # 🔴 FILTER 1: Prioritize and remap bioRxiv version configurations
     ref_num_to_url = optimize_biorxiv_versions(ref_num_to_url)
-    unique_urls = list(set(ref_num_to_url.values()))
+
+    # 🔴 Use dict.fromkeys instead of set(...) to preserve first-seen order
+    # deterministically. Disambiguation below assigns suffixes (a, b, c...)
+    # based on encounter order, so this keeps results reproducible across runs
+    # instead of depending on Python's randomized set/hash ordering.
+    unique_urls = list(dict.fromkeys(ref_num_to_url.values()))
 
     print("\n🌐 Step 2: Fetching deep metadata and handling provider exceptions...")
     url_metadata_registry = {}
@@ -758,6 +887,11 @@ def convert(input_docx, output_docx="marked_document.docx", output_ris="zotero_i
     # 🔴 FILTER 3: Resolve duplicate titles and merge reference assignments
     url_metadata_registry, ref_num_to_url = resolve_duplicate_titles_and_registry(url_metadata_registry, ref_num_to_url)
 
+    # 🔴 FILTER 4: Detect and disambiguate {Display, Year} in-text marker
+    # collisions so Zotero's RTF Scan never encounters two distinct sources
+    # rendered as the exact same citation text.
+    url_metadata_registry, marker_collisions = disambiguate_author_year_collisions(url_metadata_registry)
+
     print("\n📝 Step 3: Upgrading document in-text citation markers...")
     inline_pattern = re.compile(r'\[(\d+)\]')
 
@@ -770,7 +904,8 @@ def convert(input_docx, output_docx="marked_document.docx", output_ris="zotero_i
                     url = ref_num_to_url[ref_num]
                     if url in url_metadata_registry:
                         meta = url_metadata_registry[url]
-                        new_text = new_text.replace(f"[{ref_num}]", f"{{{meta['display']}, {meta['year']}}}")
+                        marker_year = meta.get('marker_year', meta['year'])
+                        new_text = new_text.replace(f"[{ref_num}]", f"{{{meta['display']}, {marker_year}}}")
             para.text = new_text
 
     doc.save(output_docx)
@@ -782,11 +917,15 @@ def convert(input_docx, output_docx="marked_document.docx", output_ris="zotero_i
             ris_file.write(f"TY  - {data['type']}\n")
             for author in data['authors']:
                 ris_file.write(f"AU  - {author}\n")
-            ris_file.write(f"PY  - {data['year']}\n")
+            ris_file.write(f"PY  - {data['year']}\n")  # true year -- unaffected by marker disambiguation
             ris_file.write(f"TI  - {data['title']}\n")
             if data['journal']: ris_file.write(f"JO  - {data['journal']}\n")
             ris_file.write(f"UR  - {url}\n")
             ris_file.write("ER  - \n\n")
+
+    # 🔴 Priority 3: Proactively surface ambiguity instead of letting the user
+    # discover it only when Zotero's RTF Scan prompts mid-workflow.
+    print_collision_summary(ref_num_collisions, marker_collisions, url_metadata_registry)
 
     print(f"✅ Success!")
 
