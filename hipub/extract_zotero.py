@@ -704,50 +704,105 @@ def convert(input_docx, output_docx="marked_document.docx", output_ris="zotero_i
             display_name = get_display_author(authors)
             title = re.sub(r'\s+', ' ', title).strip()
 
+            # Generate unique citekey for Pandoc mapping
+            author_clean = re.sub(r'[^a-zA-Z]', '', display_name.split()[0])
+            citekey = f"{author_clean}{year}"
+            while any(d.get('citekey') == citekey for d in url_metadata_registry.values()):
+                citekey += "a"
+
             url_metadata_registry[url] = {
-                'type': 'JOUR', 'authors': authors, 'display': display_name, 'year': year, 'title': title, 'journal': journal
+                'type': 'JOUR', 'authors': authors, 'display': display_name, 'year': year, 'title': title, 'journal': journal, 'citekey': citekey
             }
             print(f"  ✅ Asset Found: {display_name} ({year})")
 
     # 🔴 FILTER 3: Resolve duplicate titles and merge reference assignments
     url_metadata_registry, ref_num_to_url, url_remap = resolve_duplicate_titles_and_registry(url_metadata_registry, ref_num_to_url)
 
-    # 🔴 FIX INTEGRATION: Write native triplet tokens: {Author, "Title", Year}
-    print("\n📝 Step 3: Upgrading document in-text citation markers...")
-    inline_pattern = re.compile(r'\[(\d+)\]')
+    # 🔴 FIX INTEGRATION: Disambiguate collisions and convert to Pandoc format
+    print("\n📝 Step 3: Upgrading document in-text citation markers to Pandoc format...")
+
+    # 1. Detect Author-Year collisions
+    author_year_groups = {}
+    for url, meta in url_metadata_registry.items():
+        display = meta['display']
+        base_author = display.replace(' et al.', '').strip() if ' et al.' in display else display.strip()
+        year = meta['year']
+        group_key = f"{base_author.lower()}|{year}"
+
+        if group_key not in author_year_groups:
+            author_year_groups[group_key] = []
+        author_year_groups[group_key].append(url)
+
+    # Assign disambiguation suffixes (a, b, c...) only to colliding groups
+    for group_key, urls in author_year_groups.items():
+        if len(urls) > 1:
+            urls_sorted = sorted(urls, key=lambda u: url_metadata_registry[u]['title'])
+            for idx, url in enumerate(urls_sorted):
+                suffix = chr(ord('a') + idx)
+                url_metadata_registry[url]['disambiguation_suffix'] = suffix
+        else:
+            url_metadata_registry[urls[0]]['disambiguation_suffix'] = ""
+
+    inline_num_pattern = re.compile(r'\[(\d+)\]')
 
     for para in doc.paragraphs:
-        matches = inline_pattern.findall(para.text)
+        text = para.text
+        if not text:
+            continue
+
+        # Convert numeric markers [1] to Pandoc format [@citekey]
+        matches = inline_num_pattern.findall(text)
         if matches:
-            new_text = para.text
             for ref_num in matches:
                 if ref_num in ref_num_to_url:
                     url = ref_num_to_url[ref_num]
                     if url in url_metadata_registry:
                         meta = url_metadata_registry[url]
-                        # Replace internal double-quotes with single-quotes to protect the Zotero marker structure
-                        safe_title = meta['title'].replace('"', "'")
-                        # ODF/DOCX Scan (Scannable Cite) pipe-separated marker syntax
-                        # Format: {prefix | readable cite | locator | suffix | Item URI}
-                        zotero_marker = f'{{ | {meta["display"]}, "{safe_title}", {meta["year"]} | | | }}'
-                        new_text = new_text.replace(f"[{ref_num}]", zotero_marker)
-            para.text = new_text
+                        suffix = meta.get('disambiguation_suffix', '')
+                        # Pandoc marker syntax: [@citekey]
+                        pandoc_marker = f"[@{meta['citekey']}{suffix}]"
+                        text = text.replace(f"[{ref_num}]", pandoc_marker)
+
+            # Merge adjacent Pandoc markers: [@A][@B] -> [@A; @B]
+            text = re.sub(r'\]\s*\[@', '; @', text)
+
+        para.text = text
 
     doc.save(output_docx)
     print(f"💾 File updates successfully written to: {output_docx}")
 
-    # 🔴 FIX INTEGRATION: Output clean database variables (No name-mangled items)
-    print("\n📁 Step 4: Formatting and outputting Zotero RIS database...")
-    with open(output_ris, 'w', encoding='utf-8') as ris_file:
+    # 🔴 FIX INTEGRATION: Output Zotero RIS database with M2 tag for guaranteed Citation Key mapping
+    output_ris_file = output_ris if output_ris.endswith('.ris') else output_ris.replace('.bib', '.ris')
+    print(f"\n📁 Step 4: Formatting and outputting Zotero RIS database to {output_ris_file}...")
+
+    with open(output_ris_file, 'w', encoding='utf-8') as ris_file:
         for url, data in url_metadata_registry.items():
-            ris_file.write(f"TY  - {data['type']}\n")
-            for author in data['authors']:
-                ris_file.write(f"AU  - {author}\n")
-            ris_file.write(f"PY  - {data['year']}\n")
+            suffix = data.get('disambiguation_suffix', '')
+            unique_citekey = f"{data['citekey']}{suffix}"
+            disambiguated_year = f"{data['year']}{suffix}"
+
+            ris_file.write("TY  - JOUR\n")
+            ris_file.write(f"ID  - {unique_citekey}\n")
             ris_file.write(f"TI  - {data['title']}\n")
-            if data['journal']: ris_file.write(f"JO  - {data['journal']}\n")
+
+            for author in data['authors']:
+                # RIS requires "Last, First" or "Last, First Init" format
+                ris_file.write(f"AU  - {author}\n")
+
+            ris_file.write(f"PY  - {disambiguated_year}\n")
+
+            if data['journal']:
+                ris_file.write(f"JO  - {data['journal']}\n")
+
             ris_file.write(f"UR  - {url}\n")
+
+            # CRITICAL FIX: The M2 tag maps natively to Zotero's "Extra" field.
+            # Zotero natively parses "Citation Key: " from the Extra field and locks it into the metadata pane.
+            ris_file.write(f"M2  - Citation Key: {unique_citekey}\n")
+
             ris_file.write("ER  - \n\n")
+
+    print(f"💾 RIS file successfully written. Import this .ris file into Zotero.")
 
     print_collision_summary(ref_num_collisions)
     print(f"✅ Success!")
