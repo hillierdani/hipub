@@ -11,7 +11,8 @@ A Python script that scans a Word document (`.docx`) for URLs in references, res
 ## Dependencies
 
 ```
-docx, fire, pypdf, requests, urllib (stdlib)
+docx, fire, pypdf, requests
+# Standard library: io, re, json, string, datetime, html, collections
 ```
 
 ## Usage
@@ -54,6 +55,8 @@ The script parses the document paragraphs and extracts all URLs referenced in:
 
 Each extracted URL is assigned a reference number and mapped to a dictionary (`ref_num_to_url`).
 
+**Cross-check filter:** After extraction, the script scans the entire document for `[n]` citation patterns and filters out any URLs that are never cited in the text, keeping only cited references.
+
 ### Step 2: BioRxiv Version Optimization
 
 If the references contain multiple versions of the same bioRxiv preprint (e.g., `v1`, `v2`), the script identifies the latest version and remaps all older URL markers to point to the latest version.
@@ -72,9 +75,11 @@ For each unique URL, the script calls `get_live_metadata()` which attempts (in p
 | **eLife resolver** | Articles from elifesciences.org |
 | **Nature synthesiser** | Articles from nature.com/articles/* |
 | **Crossref query** | Text-based fallback searches |
+| **DOI from meta tags** | Scrapes HTML meta tags for DOI (mainly for OUP) |
+| **Crossref query** | Text-based fallback searches |
 | **Web scraping** | Fallback — grabs page HTML meta tags (citation_title, citation_author, etc.) |
 
-The script includes a whitelist of trusted academic domains (pubmed, sciencedirect, nature.com, biorxiv, frontiersin, etc.) and a blacklist of non-academic domains (YouTube, Wikipedia, Reddit, medium, news sites, etc.) that are excluded from results.
+The script includes a blacklist of non-academic domains (YouTube, Wikipedia, Ahrefs, Grammarly, etc.) that are filtered out, plus a whitelist of trusted academic domains (pubmed, sciencedirect, nature.com, biorxiv, frontiersin, etc.).
 
 #### API Key Requirement
 
@@ -82,7 +87,7 @@ The script uses a hardcoded NCBI API key for PubMed/PMC queries. To obtain your 
 
 ### Step 4: Duplicate Resolution
 
-If multiple URLs resolve to the same paper title, the script merges them — keeping the metadata entry with the most complete journal information and removing duplicates from the registry.
+If multiple URLs resolve to the same paper title, the script merges them — keeping the metadata entry with the most complete journal information and removing duplicates from the registry. It uses a 70% title overlap threshold and prefers published papers over preprints.
 
 ### Step 5: Document Annotation (Pandoc Format)
 
@@ -95,6 +100,8 @@ Adjacent Pandoc markers are merged: `[@A][@B]` → `[@A; @B]`.
 A valid RIS file is written containing one record per resolved reference, with standard fields: `TY` (type), `AU` (authors), `PY` (year), `TI` (title), `JO` (journal), and `UR` (URL).
 
 The `M2` tag maps natively to Zotero's "Extra" field, which Zotero parses to set the **Citation Key** in the metadata pane, ensuring perfect matching between the Pandoc markers and imported references.
+
+**Author normalization:** Author names are strictly formatted as `Lastname, Initials` (e.g., `Smith, J.A.`) to ensure consistent matching across sources and proper Zotero integration.
 
 ---
 
@@ -131,7 +138,7 @@ The script can resolve metadata from:
 - bioRxiv preprints (with version handling)
 - Nature published articles
 - eLife articles
-- Oxford University Press (OUP) links
+- Oxford University Press (OUP) links (via DOI extraction from meta tags)
 - Direct PDF files (DOI extraction from embedded metadata)
 
 Administrative, Wikipedia, news, and non-scientific URLs are filtered out during processing.
@@ -142,4 +149,5 @@ Administrative, Wikipedia, news, and non-scientific URLs are filtered out during
 
 - The script returns `"2026"` as a default year when metadata cannot be resolved.
 - Web-scraping attempts have a 5–10 second timeout to prevent hangs.
-- The `is_academic_record()` filter ensures only legitimate scientific papers make it into the final output.
+- The `ADMIN_DOMAINS` list filters out known non-academic domains.
+- The duplicate resolution uses a 70% significant-word overlap threshold.
