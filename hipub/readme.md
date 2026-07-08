@@ -3,7 +3,7 @@
 ## Overview
 
 A Python script that scans a Word document (`.docx`) for URLs in references, resolves academic metadata from multiple registry APIs (Crossref, PubMed, arXiv, PMC, OpenReview), and outputs:
-- A marked document (`.docx`) with citation placeholders like `{Smith, 2024}`
+- A marked document (`.docx`) with **Pandoc citation markers** like `[@Smith2024a]`
 - An RIS file (`.ris`) for importing into Zotero
 
 ---
@@ -33,7 +33,7 @@ python extract_zotero.py paper.docx --output_docx=my_marked.docx --output_ris=my
 | Argument | Default | Description |
 |----------|---------|-------------|
 | `input_docx` | (required) | Input Word document to process |
-| `output_docx` | `marked_document.docx` | Output marked document |
+| `output_docx` | `marked_document.docx` | Output marked document (Pandoc format) |
 | `output_ris` | `zotero_import.ris` | Output RIS bibliography file |
 
 ### PyCharm Configuration
@@ -63,7 +63,7 @@ If the references contain multiple versions of the same bioRxiv preprint (e.g., 
 For each unique URL, the script calls `get_live_metadata()` which attempts (in priority order):
 
 | Route | Target |
-|-------|--------|
+|-------|-------|
 | **Crossref DOI API** | Standard DOI-based papers |
 | **Entrez/PMC API** | PubMed Central articles (PMCID) |
 | **Entrez/PubMed API** | Standard PubMed IDs (PMID) |
@@ -84,13 +84,17 @@ The script uses a hardcoded NCBI API key for PubMed/PMC queries. To obtain your 
 
 If multiple URLs resolve to the same paper title, the script merges them — keeping the metadata entry with the most complete journal information and removing duplicates from the registry.
 
-### Step 5: Document Annotation
+### Step 5: Document Annotation (Pandoc Format)
 
-The script rewrites all `[n]` in-text citation markers in the document to `{DisplayAuthor, Year}` format (e.g., `{Smith et al., 2024}`). The "display" author is the cleaned primary surname followed by "et al." if multiple authors are detected.
+The script rewrites all `[n]` in-text citation markers in the document to **Pandoc citation format** `[@citekey]` (e.g., `[@Smith2024]`). When multiple papers share the same author-year combination, disambiguation suffixes are added (e.g., `[@Smith2024a]`, `[@Smith2024b]`).
+
+Adjacent Pandoc markers are merged: `[@A][@B]` → `[@A; @B]`.
 
 ### Step 6: RIS Bibliography Export
 
 A valid RIS file is written containing one record per resolved reference, with standard fields: `TY` (type), `AU` (authors), `PY` (year), `TI` (title), `JO` (journal), and `UR` (URL).
+
+The `M2` tag maps natively to Zotero's "Extra" field, which Zotero parses to set the **Citation Key** in the metadata pane, ensuring perfect matching between the Pandoc markers and imported references.
 
 ---
 
@@ -103,19 +107,16 @@ A valid RIS file is written containing one record per resolved reference, with s
 3. Zotero will import these items.
 4. Imported references should go to a new collection. If you see many unresolved links or weird items, you can remove them (Cmd+Option+Backspace can move items into trash). This way you don't clutter your Zotero database.
 
-### Step 2: Convert the Word Doc to RTF
+### Step 2: Use the ODF Import Plugin with Pandoc
 
 1. Open the newly created `marked_document.docx` in **Microsoft Word**.
-2. Go to **File > Save As**.
-3. In the file format dropdown, select **Rich Text Format (.rtf)** and save it.
+2. Install and open the **ODF Import Plugin** (selecting **Pandoc** as the converter).
+3. The script has already converted all `[n]` markers to Pandoc format `[@citekey]`.
+4. The ODF Import plugin with Pandoc resolves these Pandoc citations back to formatted references in the final document.
 
-### Step 3: Run Zotero RTF Scan
-
-1. In Zotero, click **Tools** in the top menu bar and select **RTF Scan**.
-2. For the **Input File**, select the `.rtf` file you just saved.
-3. Choose a name for the **Output File** (e.g., `final_citations.rtf`).
-4. Click **Next**. Zotero will match `{Smith, 2024}` tags with the imported item and convert them into live database links (Ref1, Ref2, etc.).
-
+### Step 3: Finalize the Document in Word/Libreoffice
+Open the output of Zotero ODF Scan in Word/LibreOffice. You may need to define Zotero citation format (e.g. eLife). Upon selecting a journal format, Zotero will reformat citations.
+Done.
 ---
 
 ## Supported URL Types
